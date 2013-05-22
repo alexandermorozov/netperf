@@ -1,23 +1,24 @@
-{-# LANGUAGE DeriveDataTypeable #-}
-
 import Control.Applicative (pure)
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent.STM.TChan (TChan, newTChan, readTChan, writeTChan, 
+import Control.Concurrent.STM.TChan (TChan, newTChan, readTChan, writeTChan,
                                      isEmptyTChan)
 import Control.Exception (try, SomeException)
-import Control.Monad (forever, forM_)
+import Control.Monad (forever, forM_, liftM)
 import qualified Data.ByteString as BS
 import Data.Function (on)
+import qualified Data.Map as M
 import Data.Maybe (catMaybes)
 import qualified Network.Socket as S
 import qualified Network.Socket.ByteString as SB
 import System.Environment (getArgs)
-import System.IO (hSetBuffering, hGetLine, hPutStrLn, BufferMode(..), Handle)
+import System.IO (openFile, hSetBuffering, hGetLine, hPutStrLn,
+                  IOMode (..), BufferMode(..), Handle)
 import System.Timeout (timeout)
+import System.Time (getClockTime, ClockTime(TOD))
 import Text.Printf (printf)
 
-                   
+
 data Message = NewRxConnection S.SockAddr
              | LostRxConnection
              | NewTxConnection
@@ -30,27 +31,29 @@ data Message = NewRxConnection S.SockAddr
 data TxConnMessage = TxEstablished
                    | TxLost
                    | TxFailed
-  
-data Stats = Stats 
+
+data LogMessage = LogString String | LogStats BinStats deriving (Show)
+
+data Stats = Stats
     { sRxBytes :: !Integer
     , sTxBytes :: !Integer
     } deriving Show
-                      
-data Bin = Bin 
+
+data Bin = Bin
     { bTicks     :: !Int
     , bMaxTicks  :: !Int
-    , bPrevStats :: !Stats 
+    , bPrevStats :: !Stats
     } deriving Show
-                
+
 data BinStats = BinStats
     { bsTicks   :: !Int
     , bsRxBytes :: !Integer
     , bsTxBytes :: !Integer
     } deriving Show
-      
+
 blockSize = 2^16
 defaultTickPeriodUs = 1000000 :: Int
-defaultTicksPerBin = [1, 5, 20, 60]
+defaultTicksPerBin = [1, 20, 60, 600, 3600]
 
 main :: IO ()
 main = S.withSocketsDo $ do
@@ -62,14 +65,56 @@ main = S.withSocketsDo $ do
             localPort = read $ args !! 1
             peerPort  = read $ args !! 3
         peerAddr <- S.inet_addr $ args !! 2
-        chan <- atomically newTChan
-        forkIO $ doRx chan localPort
-        forkIO $ doTx chan (S.SockAddrInet (fromIntegral peerPort) peerAddr) threads
-        doReporting chan
+        dataChan <- atomically newTChan
+        logChan  <- atomically newTChan
+        forkIO $ doRx dataChan localPort
+        forkIO $ doTx dataChan (S.SockAddrInet (fromIntegral peerPort) peerAddr)
+                      threads
+        forkIO $ gatherStats dataChan logChan
+        writeLogs logChan
+        return ()
 
 
-doReporting :: TChan Message -> IO ()    
-doReporting chan = do
+writeLogs :: TChan LogMessage -> IO ()
+writeLogs chan = do
+    mainLog <- open "main.log"
+    loop mainLog M.empty
+  where
+    open name = do
+        h <- openFile name AppendMode
+        hSetBuffering h NoBuffering
+        return h
+
+    loop mainLog tickLogs = do
+        m  <- atomically $ readTChan chan
+        ut <- liftM fmtClock getClockTime
+        case m of
+            LogString s -> do
+                putStrLn s
+                hPutStrLn mainLog $ ut ++ " " ++ s
+                loop mainLog tickLogs
+            LogStats bw@(BinStats ticks rx tx) -> do
+                let rx' = 8 * rx `div` (fromIntegral ticks)
+                    tx' = 8 * tx `div` (fromIntegral ticks)
+                (tickLogs', h) <- getOrOpen tickLogs ticks
+                putStrLn $ fmtBw bw
+                hPutStrLn h (ut ++ " " ++ show rx' ++ " " ++ show tx')
+                loop mainLog tickLogs'
+
+    getOrOpen tickLogs ticks =
+        case M.lookup ticks tickLogs of
+            Just h -> return (tickLogs, h)
+            Nothing -> do h <- open $ "bw" ++ show ticks ++ ".log"
+                          return (M.insert ticks h tickLogs, h)
+
+    fmtClock (TOD s ps) = printf "%d.%06d" s (ps `div` 10^6)
+
+    fmtBw s = let ticks = bsTicks s
+                  fmt x = formatBw (8 * x `div` fromIntegral ticks)
+              in (fmt $ bsRxBytes s) ++ " " ++ (fmt $ bsTxBytes s)
+
+gatherStats :: TChan Message -> TChan LogMessage -> IO ()
+gatherStats chan logChan = do
     forkIO $ tick
     let stats = Stats 0 0
     let bins = map (\n -> Bin 0 n stats) defaultTicksPerBin
@@ -80,18 +125,19 @@ doReporting chan = do
         atomically $ writeTChan chan Tick
 
     processMessages stats bins = do
-        m <- atomically $ readTChan chan 
+        m <- atomically $ readTChan chan
         case m of
-            DataReceived n -> let stats' = stats {sRxBytes = sRxBytes stats + 
+            DataReceived n -> let stats' = stats {sRxBytes = sRxBytes stats +
                                                          fromIntegral n}
                               in processMessages stats' bins
-            DataSent n     -> let stats' = stats {sTxBytes = sTxBytes stats + 
+            DataSent n     -> let stats' = stats {sTxBytes = sTxBytes stats +
                                                          fromIntegral n}
                               in processMessages stats' bins
             Tick           -> let (bins', diffs) = unzip $ map (updateBin stats) bins
                                   diffs' = catMaybes diffs
                               in printStats diffs' >> processMessages stats bins'
-            m              -> print m >> processMessages stats bins
+            m              -> do atomically $ writeTChan logChan (LogString $ show m)
+                                 processMessages stats bins
     updateBin stats bin =
         let ticks' = (bTicks bin + 1) `rem` bMaxTicks bin
             bin'  = bin {bTicks = ticks'}
@@ -103,13 +149,10 @@ doReporting chan = do
         in case bTicks bin' of
             0 -> (bin'', Just bs)
             _ -> (bin', Nothing)
-    printStats stats = forM_ stats $ \s -> do
-        let ticks = bsTicks s
-            fmt x = formatBw (8 * x `div` fromIntegral ticks)
-        let line = (fmt $ bsRxBytes s) ++ " " ++ (fmt $ bsTxBytes s)
-        print $ show ticks ++ "|" ++ line
-                 
-      
+    printStats stats = forM_ stats $ \s ->
+        atomically $ writeTChan logChan $ LogStats s
+
+
 
 doRx :: TChan Message -> Int -> IO ()
 doRx chan portno = do
@@ -169,15 +212,15 @@ doTx chan addr num = do
                 atomically $ writeTChan chan $ DataSent n
                 floodSocket chan' sock
             Left _  -> atomically $ writeTChan chan' $ TxLost
-        
-      
+
+
 suffixNames :: [(Integer, String)]
 suffixNames = zip (map (1000^) [0..]) (map pure "BKMGT")
-    
+
 formatBw :: Integer -> String
 formatBw i = let (mult, name) = findSuffix
                  val = fromIntegral i / fromIntegral mult :: Double
              in printf "%6.1f" val ++ name
-  where 
-    findSuffix = last $ head suffixNames : 
+  where
+    findSuffix = last $ head suffixNames :
                         takeWhile ((i > ) .(*10) . fst) suffixNames
