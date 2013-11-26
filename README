@@ -1,0 +1,18 @@
+Netperf is a network bandwith test tool similar to iperf.
+
+Features are:
+- multiple TCP connections,
+- auto reconnect if a connection breaks,
+- it writes statistics to several files that can be easily visualized with
+gnuplot.
+
+
+Compile it with the Glasgow Haskell Compiler (GHC):
+ghc -O2 -o netperf Main.hs
+
+On the first host with ip_addr_1 run:
+./netperf 4 6000 ip_addr_2 6000
+
+On the second host with ip_addr_2 run:
+./netperf 4 6000 ip_addr_1 6000
+
